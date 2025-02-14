@@ -8,10 +8,22 @@ import sys
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+import time
 
-logging.basicConfig(level=logging.DEBUG, format="%(message)s")
+from rich.console import Console
+from rich.table import Table
+from rich.live import Live
+from rich import print
+from rich.layout import Layout
+from rich.logging import RichHandler
+
+
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+
+logging.basicConfig(level="NOTSET", format="%(message)s", handlers=[RichHandler()])
 LOGGER = logging.getLogger(__name__)
-LOGGER.setLevel(logging.DEBUG)
+LOGGER.setLevel(logging.INFO)
 
 
 locale.setlocale(locale.LC_TIME, "fr_FR")
@@ -67,7 +79,7 @@ class AnytimeCSVReader:
 
             LOGGER.info(
                 f"{sign} Treating {row['Date de valeur']} --"
-                f"\"{row['Description']}\" ({row['Montant']}{row['Devise']})"
+                f'"{row["Description"]}" ({row["Montant"]}{row["Devise"]})'
             )
 
             self.records.append(row)
@@ -90,7 +102,7 @@ class AnytimeCSVReader:
 
             LOGGER.info(
                 f"{sign} Treating {row['Date']} --"
-                f"\"{row['Description']}\" ({row['Montant']}€)"
+                f'"{row["Description"]}" ({row["Montant"]}€)'
             )
             self.records.append(row)
 
@@ -98,23 +110,32 @@ class AnytimeCSVReader:
 
         return len(self.records)
 
-    def _check_attachments(self, record):
+    def attachment_count(self, record):
         file_count = int(record["Documents Fournis"])
+        return file_count
 
-        if file_count > 0:
+    def _check_attachments(self, record):
+        file_count = self.attachment_count(record)
+
+        if file_count:
             LOGGER.info(
                 bcolors.OKGREEN
                 + f"\t`- {file_count} attachment provided"
                 + bcolors.ENDC
             )
         else:
-            LOGGER.warning(bcolors.WARNING + f"\t`- Missing attachment!" + bcolors.ENDC)
+            LOGGER.warning(bcolors.WARNING + "\t`- Missing attachment!" + bcolors.ENDC)
 
-    def _month_from_record(self, record):
+    def date_from_record(self, record):
         if self.csv_type == self.CSV_CB:
             day = datetime.strptime(record["Date de valeur"], "%Y-%m-%d")
         else:
             day = datetime.strptime(record["Date"], "%Y-%m-%d %H:%M:%S")
+
+        return day
+
+    def _month_from_record(self, record):
+        day = self.date_from_record(record)
         return day.strftime("%B")
 
     def download_attachments(self):
@@ -189,8 +210,20 @@ class AnytimeCSVReader:
             self.csv_type = self.CSV_COMPTE
 
 
-if __name__ == "__main__":
+class Header:
+    """Display header with clock."""
 
+    def __rich__(self) -> Panel:
+        grid = Table.grid(expand=True)
+        grid.add_column(justify="center", ratio=1)
+        grid.add_column(justify="right")
+        grid.add_row(
+            "[b]Anytime[/b] CSV checker/extractor",
+        )
+        return Panel(grid, style="white on blue")
+
+
+if __name__ == "__main__":
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} csv_dir target_dir")
         exit(1)
@@ -198,39 +231,96 @@ if __name__ == "__main__":
     target_dir = sys.argv[2]
     csv_dir = sys.argv[1]
 
-    pathlist = Path(csv_dir).glob("**/*.csv")
+    overall_progress = Progress()
+
+    layout = Layout(name="Root")
+    layout.split(
+        Layout(name="header", size=3),
+        Layout(name="main", ratio=1),
+        Layout(name="footer", size=8),
+    )
+
+    layout["header"].update(Header())
+
+    table = Table(title="Operations")
+    table.add_column("Date", justify="right", style="cyan", no_wrap=True)
+    table.add_column("Compte", justify="left", style="magenta", no_wrap=True)
+    table.add_column("Description", justify="right", style="cyan", no_wrap=True)
+    table.add_column("Montant", style="green")
+    table.add_column("Justificatif?", justify="middle", style="green")
+
+    layout["main"].update(Panel(table))
+
+    pathlist = sorted(Path(csv_dir).glob("**/*.csv"))
+
+    console = Console()
+
+    progress = Progress(
+        "{task.description}",
+        SpinnerColumn(),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+    )
     for path in pathlist:
-        LOGGER.info(f"Found CSV file {path}")
-        csv_reader = AnytimeCSVReader(str(path), target_dir)
-        if csv_reader.parse():
-            csv_reader.copy_csv()
-            csv_reader.download_attachments()
-        else:
-            LOGGER.warning("No record found in CSV, skipping!")
+        progress.add_task(path)
+
+    layout["footer"].update(Panel(progress, title="Progression", border_style="green"))
+
+    missing_attachments = []
+
+    with Live(layout, refresh_per_second=10, screen=True):
+        for idx, path in enumerate(pathlist):
+            LOGGER.info(f"Found CSV file {path}")
+            csv_reader = AnytimeCSVReader(str(path), target_dir)
+            if csv_reader.parse():
+                csv_type = {
+                    AnytimeCSVReader.CSV_CB: "CB",
+                    AnytimeCSVReader.CSV_COMPTE: "Compte Courant",
+                }[csv_reader.csv_type]
+
+                # Add generated records to table
+                for record_idx, record in enumerate(csv_reader.records):
+                    time.sleep(0.01)
+                    attach_count = csv_reader.attachment_count(record)
+                    table.add_row(
+                        csv_reader.date_from_record(record).strftime("%Y-%m-%d"),
+                        str(csv_type),
+                        f"{record['Description']}",
+                        f"{record['Montant']}€",
+                        str(attach_count),
+                    )
+
+                    progress.update(
+                        idx, completed=record_idx / len(csv_reader.records) * 80
+                    )
+
+                    if attach_count == 0:
+                        missing_attachments.append(
+                            (
+                                csv_reader.date_from_record(record).strftime(
+                                    "%Y-%m-%d"
+                                ),
+                                str(csv_type),
+                                f"{record['Description']}",
+                                f"{record['Montant']}€",
+                            )
+                        )
+
+                csv_reader.copy_csv()
+                progress.update(idx, completed=90)
+                csv_reader.download_attachments()
+                progress.update(idx, completed=100)
+            else:
+                LOGGER.warning("No record found in CSV, skipping!")
 
     # make zip
+    LOGGER.info("Making ZIP archive for your accountant!")
     shutil.make_archive(target_dir, "zip", target_dir)
 
+    LOGGER.info("Writing missing attachment file to justificatifs-manquants.csv")
+    with open(f"{target_dir}/justificatifs-manquants.csv", "w") as csvfile:
+        csvwriter = csv.writer(csvfile)
+        for attachment in missing_attachments:
+            csvwriter.writerow(attachment)
+
     exit(0)
-
-if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} csv_cpt csv_cb target_dir")
-        exit(1)
-
-    os.makedirs(os.path.join(sys.argv[3], FILE_DIR), exist_ok=True)
-
-    shutil.copyfile(sys.argv[1], os.path.join(sys.argv[3], sys.argv[1]))
-    with open(sys.argv[1], encoding="iso-8859-1") as csvfile:
-        reader = csv.reader(csvfile, delimiter=";")
-        print(bcolors.BOLD + "****** BANK ACCOUNT *******" + bcolors.ENDC)
-        treat_cpt(reader, sys.argv[3])
-
-    shutil.copyfile(sys.argv[2], os.path.join(sys.argv[3], sys.argv[2]))
-    with open(sys.argv[2], encoding="iso-8859-1") as csvfile:
-        reader = csv.reader(csvfile, delimiter=";")
-        print(bcolors.BOLD + "****** CARD ACCOUNT *******" + bcolors.ENDC)
-        treat_cb(reader, sys.argv[3])
-
-    # make zip
-    shutil.make_archive(f"{sys.argv[3]}", "zip", sys.argv[3])
