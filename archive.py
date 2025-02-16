@@ -1,11 +1,12 @@
 #!/bin/env python3
+import magic
 import csv
 import locale
 import logging
 import os
 import shutil
 import sys
-import urllib.request
+import requests
 from datetime import datetime
 from pathlib import Path
 import time
@@ -23,8 +24,6 @@ from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
 
 logging.basicConfig(level="NOTSET", format="%(message)s", handlers=[RichHandler()])
 LOGGER = logging.getLogger(__name__)
-LOGGER.setLevel(logging.INFO)
-
 
 locale.setlocale(locale.LC_TIME, "fr_FR")
 
@@ -152,7 +151,10 @@ class AnytimeCSVReader:
                 elif self.csv_type == self.CSV_COMPTE:
                     prefix = f"{record['Date']} - COMPTE - "
 
-                self._download_file(file_url, download_dir, prefix=prefix)
+                if file_path := self._download_file(
+                    file_url, download_dir, prefix=prefix
+                ):
+                    record["PJ"] = file_path
 
     def copy_csv(self):
         month_dir = self._month_from_record(self.records[0])
@@ -180,19 +182,44 @@ class AnytimeCSVReader:
             if prefix:
                 filename = f"{prefix}{filename}"
 
-            target_path = os.path.join(target_dir, filename)
+            cache_path = os.path.join(target_dir, f"{filename}.data")
 
-            if not os.path.exists(target_path):
+            if not os.path.exists(cache_path):
                 LOGGER.debug(
                     bcolors.OKCYAN + f"---> Retrieving {url}..." + bcolors.ENDC
                 )
-                urllib.request.urlretrieve(url, target_path)
+                r = requests.get(url, stream=True)
+                if r.ok:
+                    # First, copy as raw since we don't know the filetype
+                    with open(cache_path, "wb") as f:
+                        r.raw.decode_content = True
+                        shutil.copyfileobj(r.raw, f)
+                else:
+                    LOGGER.warning(f"Unable to download {url}")
+                    return None
             else:
                 LOGGER.debug(
                     bcolors.OKCYAN
-                    + f"---> {filename} already in cache, skipping"
+                    + f"---> {filename} already downloaded, skipping"
                     + bcolors.ENDC
                 )
+
+            # Now we have the data, try to guess what type we have
+            # using mimetype
+            mime = magic.from_file(cache_path)
+            mime = mime.lower()
+            extension = "??"
+            if ("jpg" in mime) or ("jpeg" in mime):
+                extension = "jpg"
+            elif "png" in mime:
+                extension = "png"
+            elif "pdf" in mime:
+                extension = "pdf"
+
+            shutil.copy(cache_path, os.path.join(target_dir, f"{filename}.{extension}"))
+            target_path = cache_path
+
+            return target_path
 
     def _guess_type(self, csvfile):
         sniffer = csv.Sniffer()
